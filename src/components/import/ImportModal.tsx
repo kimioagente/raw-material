@@ -12,7 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { supabase } from '@/lib/supabase'
 import { usePeriodStore } from '@/stores/periodStore'
 import { getPeriodLabel, calcPriceCheck } from '@/lib/calculations'
-import { parseNFe, type ParsedNFe } from './XmlParser'
+import { parseNFe, formatCNPJ, type ParsedNFe } from './XmlParser'
 import { toast } from '@/hooks/useToast'
 
 interface MatchResult {
@@ -21,9 +21,15 @@ interface MatchResult {
   supplierName: string | null
   blockId: string | null
   blockName: string | null
-  periodId: string | null
   fileName: string
   error?: string
+}
+
+type SupplierRow = {
+  id: string
+  name: string
+  document: string | null
+  supplier_blocks: Array<{ id: string; product_name: string; product_code: string | null }>
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, name: string): Promise<T> {
@@ -33,6 +39,17 @@ function withTimeout<T>(promise: Promise<T>, ms: number, name: string): Promise<
       setTimeout(() => reject(new Error(`Timeout: ${name} demorou mais de ${ms / 1000}s`)), ms)
     ),
   ])
+}
+
+// Matching bidirecional: verifica se alguma palavra significativa (>3 chars)
+// do xProd aparece no nome do bloco ou vice-versa.
+// Ex: "SERRAGEM VERDE" ↔ "Serragem" → match
+function descricaoMatch(blockName: string, descricao: string): boolean {
+  const block = blockName.toLowerCase()
+  const desc = descricao.toLowerCase()
+  const descWords = desc.split(/\s+/).filter((w) => w.length > 3)
+  const blockWords = block.split(/\s+/).filter((w) => w.length > 3)
+  return descWords.some((w) => block.includes(w)) || blockWords.some((w) => desc.includes(w))
 }
 
 export function ImportModal() {
@@ -60,13 +77,7 @@ export function ImportModal() {
         return
       }
 
-      const suppliers = (suppliersRaw ?? []) as Array<{
-        id: string
-        name: string
-        document: string | null
-        supplier_blocks: Array<{ id: string; product_name: string; product_code: string | null }>
-      }>
-
+      const suppliers = (suppliersRaw ?? []) as SupplierRow[]
       const newResults: MatchResult[] = []
 
       for (const file of Array.from(files)) {
@@ -76,18 +87,20 @@ export function ImportModal() {
           const text = await file.text()
           const parsed = await withTimeout(parseNFe(text), 10000, file.name)
 
+          // Busca fornecedor pelo CNPJ emitente (sem formatação)
           const matchedSupplier = suppliers.find(
             (s) => s.document?.replace(/\D/g, '') === parsed.cnpjEmitente
           )
 
-          let matchedBlock = null
+          // Identifica o bloco: primeiro tenta código exato, depois matching por descrição
+          let matchedBlock: SupplierRow['supplier_blocks'][number] | undefined
           if (matchedSupplier && parsed.itens.length > 0) {
             const item = parsed.itens[0]
-            matchedBlock = matchedSupplier.supplier_blocks.find(
-              (b) =>
-                (b.product_code && b.product_code === item.codigoProduto) ||
-                b.product_name.toLowerCase().includes(item.descricao.toLowerCase().slice(0, 10))
-            )
+            matchedBlock =
+              matchedSupplier.supplier_blocks.find(
+                (b) => b.product_code && b.product_code === item.codigoProduto
+              ) ??
+              matchedSupplier.supplier_blocks.find((b) => descricaoMatch(b.product_name, item.descricao))
           }
 
           newResults.push({
@@ -96,7 +109,6 @@ export function ImportModal() {
             supplierName: matchedSupplier?.name ?? null,
             blockId: matchedBlock?.id ?? null,
             blockName: matchedBlock?.product_name ?? null,
-            periodId: null,
             fileName: file.name,
           })
         } catch (e) {
@@ -104,8 +116,10 @@ export function ImportModal() {
             parsed: {
               cnpjEmitente: '',
               nomeEmitente: '',
+              cnpjDestinatario: '',
               numeroNF: '',
               dataEmissao: '',
+              placaCaminhao: '',
               itens: [],
               valorTotal: 0,
             },
@@ -113,7 +127,6 @@ export function ImportModal() {
             supplierName: null,
             blockId: null,
             blockName: null,
-            periodId: null,
             fileName: file.name,
             error: String(e),
           })
@@ -174,6 +187,7 @@ export function ImportModal() {
             period_id: period.id,
             entry_date: r.parsed.dataEmissao || null,
             nf_number: r.parsed.numeroNF || null,
+            truck_plate: r.parsed.placaCaminhao || null,
             weight_nf: item.quantidade || null,
             value_nf: item.valorTotal || null,
             price_check: priceCheck,
@@ -203,7 +217,16 @@ export function ImportModal() {
   const readyCount = results.filter((r) => r.blockId && !r.error).length
 
   return (
-    <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) { setResults([]); setGlobalError(null) } }}>
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        setOpen(v)
+        if (!v) {
+          setResults([])
+          setGlobalError(null)
+        }
+      }}
+    >
       <DialogTrigger asChild>
         <Button variant="outline" size="sm" className="gap-1.5">
           <Upload className="h-4 w-4" />
@@ -215,7 +238,7 @@ export function ImportModal() {
           <DialogTitle>Importar Notas Fiscais (XML)</DialogTitle>
         </DialogHeader>
 
-        {/* Drop zone */}
+        {/* Área de drop */}
         <div
           onDrop={handleDrop}
           onDragOver={(e) => e.preventDefault()}
@@ -251,7 +274,7 @@ export function ImportModal() {
           </div>
         )}
 
-        {/* Results */}
+        {/* Resultados */}
         {results.length > 0 && (
           <div className="max-h-64 overflow-y-auto space-y-2">
             {results.map((r, i) => (
@@ -267,7 +290,12 @@ export function ImportModal() {
                   ) : (
                     <>
                       <p className="text-xs text-stone-500">
-                        NF {r.parsed.numeroNF} · {r.parsed.nomeEmitente || `CNPJ: ${r.parsed.cnpjEmitente || '?'}`} · {r.parsed.dataEmissao}
+                        NF {r.parsed.numeroNF}
+                        {r.parsed.placaCaminhao && ` · ${r.parsed.placaCaminhao}`}
+                        {' · '}
+                        {r.parsed.nomeEmitente || formatCNPJ(r.parsed.cnpjEmitente)}
+                        {' · '}
+                        {r.parsed.dataEmissao}
                       </p>
                       <div className="mt-1 flex items-center gap-1.5 flex-wrap">
                         {r.supplierName ? (
@@ -279,7 +307,7 @@ export function ImportModal() {
                           <Badge variant="red" className="text-[10px] gap-1">
                             <AlertTriangle className="h-2.5 w-2.5" />
                             {r.parsed.cnpjEmitente
-                              ? `Fornecedor não encontrado — CNPJ: ${r.parsed.cnpjEmitente}`
+                              ? `Fornecedor não encontrado: CNPJ ${formatCNPJ(r.parsed.cnpjEmitente)}${r.parsed.nomeEmitente ? ` (${r.parsed.nomeEmitente})` : ''}`
                               : 'CNPJ não identificado'}
                           </Badge>
                         )}
@@ -288,9 +316,19 @@ export function ImportModal() {
                             {r.blockName}
                           </Badge>
                         ) : r.supplierName ? (
-                          <Badge variant="amber" className="text-[10px]">Bloco não identificado</Badge>
+                          <Badge variant="amber" className="text-[10px]">
+                            Bloco não identificado
+                          </Badge>
                         ) : null}
                       </div>
+                      {/* Preview dos dados que serão importados */}
+                      {r.blockId && r.parsed.itens.length > 0 && (
+                        <div className="mt-2 grid grid-cols-3 gap-x-4 text-[11px] text-stone-500">
+                          <span>Ton. NF: <strong>{r.parsed.itens[0].quantidade}</strong></span>
+                          <span>Valor: <strong>R$ {r.parsed.itens[0].valorTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</strong></span>
+                          <span>Caminhão: <strong>{r.parsed.placaCaminhao || '—'}</strong></span>
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
@@ -310,9 +348,15 @@ export function ImportModal() {
               className="gap-1.5"
             >
               {importing ? (
-                <><Loader2 className="h-4 w-4 animate-spin" />Importando...</>
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Importando...
+                </>
               ) : (
-                <><Check className="h-4 w-4" />Importar {readyCount} NF{readyCount !== 1 ? 's' : ''}</>
+                <>
+                  <Check className="h-4 w-4" />
+                  Importar {readyCount} NF{readyCount !== 1 ? 's' : ''}
+                </>
               )}
             </Button>
           </div>
