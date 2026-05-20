@@ -1,5 +1,3 @@
-import { parseString } from 'xml2js'
-
 export interface ParsedNFe {
   cnpjEmitente: string
   nomeEmitente: string
@@ -16,73 +14,67 @@ export interface ParsedItem {
   valorTotal: number
 }
 
-function safeGet(obj: unknown, ...keys: (string | number)[]): unknown {
-  let cur: unknown = obj
-  for (const k of keys) {
-    if (cur == null || typeof cur !== 'object') return undefined
-    cur = (cur as Record<string | number, unknown>)[k]
-  }
-  return cur
+function getEl(parent: Document | Element, tag: string): Element | null {
+  return parent.getElementsByTagName(tag)[0] ?? null
 }
 
-function firstVal(v: unknown): string {
-  if (Array.isArray(v)) return firstVal(v[0])
-  if (typeof v === 'string') return v
-  if (typeof v === 'object' && v !== null) {
-    const entry = Object.values(v as Record<string, unknown>)[0]
-    return firstVal(entry)
-  }
-  return String(v ?? '')
+function getText(parent: Document | Element, tag: string): string {
+  return getEl(parent, tag)?.textContent?.trim() ?? ''
 }
 
 export function parseNFe(xmlString: string): Promise<ParsedNFe> {
   return new Promise((resolve, reject) => {
-    parseString(xmlString, { explicitArray: true, trim: true }, (err, result) => {
-      if (err) return reject(new Error('XML inválido: ' + err.message))
+    try {
+      const parser = new DOMParser()
+      const doc = parser.parseFromString(xmlString, 'text/xml')
 
-      try {
-        const root = result?.nfeProc ?? result?.NFe ?? result
-        const nfe = safeGet(root, 'NFe', 0) ?? root?.NFe
-        const infNFe = safeGet(nfe, 'infNFe', 0) ?? safeGet(root, 'infNFe', 0)
-
-        if (!infNFe) return reject(new Error('Estrutura NF-e não reconhecida'))
-
-        const emit = safeGet(infNFe, 'emit', 0) as Record<string, unknown>
-        const ide = safeGet(infNFe, 'ide', 0) as Record<string, unknown>
-        const total = safeGet(infNFe, 'total', 0) as Record<string, unknown>
-        const detArr = (safeGet(infNFe, 'det') as unknown[]) ?? []
-
-        const cnpj = firstVal(safeGet(emit, 'CNPJ', 0) ?? safeGet(emit, 'CNPJ'))
-        const nome = firstVal(safeGet(emit, 'xNome', 0) ?? safeGet(emit, 'xNome'))
-        const nNF = firstVal(safeGet(ide, 'nNF', 0) ?? safeGet(ide, 'nNF'))
-        const dhEmi = firstVal(safeGet(ide, 'dhEmi', 0) ?? safeGet(ide, 'dEmi', 0) ?? safeGet(ide, 'dhEmi'))
-        const vNF = firstVal(safeGet(total, 'ICMSTot', 0, 'vNF', 0) ?? safeGet(total, 'ICMSTot', 'vNF'))
-
-        const itens: ParsedItem[] = detArr.map((det: unknown) => {
-          const d = det as Record<string, unknown>
-          const prod = (safeGet(d, 'prod', 0) ?? safeGet(d, 'prod')) as Record<string, unknown>
-          return {
-            codigoProduto: firstVal(safeGet(prod, 'cProd', 0) ?? ''),
-            descricao: firstVal(safeGet(prod, 'xProd', 0) ?? ''),
-            quantidade: parseFloat(firstVal(safeGet(prod, 'qCom', 0) ?? '0')) || 0,
-            valorTotal: parseFloat(firstVal(safeGet(prod, 'vProd', 0) ?? '0')) || 0,
-          }
-        })
-
-        // Parse date — handles 2024-01-15T... or 2024-01-15
-        const dateStr = dhEmi.includes('T') ? dhEmi.split('T')[0] : dhEmi.slice(0, 10)
-
-        resolve({
-          cnpjEmitente: cnpj.replace(/\D/g, ''),
-          nomeEmitente: nome,
-          numeroNF: nNF,
-          dataEmissao: dateStr,
-          itens,
-          valorTotal: parseFloat(vNF) || 0,
-        })
-      } catch (e) {
-        reject(new Error('Erro ao interpretar NF-e: ' + String(e)))
+      const parseError = doc.querySelector('parsererror')
+      if (parseError) {
+        return reject(new Error('XML inválido: ' + (parseError.textContent ?? '').slice(0, 200)))
       }
-    })
+
+      const infNFe = getEl(doc, 'infNFe')
+      if (!infNFe) {
+        return reject(new Error('Estrutura NF-e não reconhecida — tag infNFe não encontrada'))
+      }
+
+      const emit = getEl(infNFe, 'emit')
+      const ide = getEl(infNFe, 'ide')
+
+      if (!emit || !ide) {
+        return reject(new Error('Estrutura NF-e incompleta: emit ou ide não encontrado'))
+      }
+
+      const cnpj = getText(emit, 'CNPJ')
+      const nome = getText(emit, 'xNome')
+      const nNF = getText(ide, 'nNF')
+      const dhEmi = getText(ide, 'dhEmi') || getText(ide, 'dEmi')
+
+      const icmsTot = getEl(infNFe, 'ICMSTot')
+      const vNF = icmsTot ? getText(icmsTot, 'vNF') : ''
+
+      const detElements = infNFe.getElementsByTagName('det')
+      const itens: ParsedItem[] = Array.from(detElements).map((det) => ({
+        codigoProduto: getText(det, 'cProd'),
+        descricao: getText(det, 'xProd'),
+        quantidade: parseFloat(getText(det, 'qCom')) || 0,
+        valorTotal: parseFloat(getText(det, 'vProd')) || 0,
+      }))
+
+      const dateStr = dhEmi.includes('T') ? dhEmi.split('T')[0] : dhEmi.slice(0, 10)
+
+      console.log('[XML PARSE] CNPJ:', cnpj, '| NF:', nNF, '| Emitente:', nome, '| Itens:', itens.length, itens)
+
+      resolve({
+        cnpjEmitente: cnpj.replace(/\D/g, ''),
+        nomeEmitente: nome,
+        numeroNF: nNF,
+        dataEmissao: dateStr,
+        itens,
+        valorTotal: parseFloat(vNF) || 0,
+      })
+    } catch (e) {
+      reject(new Error('Erro ao interpretar NF-e: ' + String(e)))
+    }
   })
 }

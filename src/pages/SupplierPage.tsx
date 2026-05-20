@@ -131,13 +131,17 @@ export function SupplierPage() {
             Configurar blocos
           </Button>
         </div>
+      ) : !period ? (
+        <div className="flex h-20 items-center justify-center">
+          <div className="h-6 w-6 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+        </div>
       ) : (
         <div className="space-y-4">
           {blocks.map((block) => (
             <MaterialBlock
               key={block.id}
               block={block}
-              periodId={period?.id ?? ''}
+              periodId={period.id}
             />
           ))}
         </div>

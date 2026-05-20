@@ -26,6 +26,7 @@ export function MaterialBlock({ block, periodId }: Props) {
   const cfg = block.column_config
 
   useEffect(() => {
+    if (!periodId) return
     const load = async () => {
       setLoading(true)
       const [{ data: ents }, { data: comp }] = await Promise.all([

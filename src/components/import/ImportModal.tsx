@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react'
-import { Upload, FileText, AlertTriangle, Check, Loader2 } from 'lucide-react'
+import { Upload, FileText, AlertTriangle, Check, Loader2, X } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -23,6 +23,16 @@ interface MatchResult {
   blockName: string | null
   periodId: string | null
   fileName: string
+  error?: string
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, name: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout: ${name} demorou mais de ${ms / 1000}s`)), ms)
+    ),
+  ])
 }
 
 export function ImportModal() {
@@ -30,60 +40,92 @@ export function ImportModal() {
   const [results, setResults] = useState<MatchResult[]>([])
   const [processing, setProcessing] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [globalError, setGlobalError] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const { current } = usePeriodStore()
 
   const processFiles = async (files: FileList) => {
     setProcessing(true)
     setResults([])
+    setGlobalError(null)
 
-    // Load all suppliers with blocks and their CNPJs
-    const { data: suppliers } = await supabase
-      .from('suppliers')
-      .select('id, name, document, supplier_blocks(id, product_name, product_code)')
-      .eq('active', true)
+    try {
+      const { data: suppliersRaw, error: supErr } = await supabase
+        .from('suppliers')
+        .select('id, name, document, supplier_blocks(id, product_name, product_code)')
+        .eq('active', true)
 
-    const newResults: MatchResult[] = []
-
-    for (const file of Array.from(files)) {
-      if (!file.name.toLowerCase().endsWith('.xml')) continue
-      try {
-        const text = await file.text()
-        const parsed = await parseNFe(text)
-
-        // Try to match supplier by CNPJ
-        const matchedSupplier = (suppliers ?? []).find(
-          (s) => s.document?.replace(/\D/g, '') === parsed.cnpjEmitente
-        )
-
-        // Try to match block by product code or description
-        let matchedBlock = null
-        if (matchedSupplier && parsed.itens.length > 0) {
-          const item = parsed.itens[0]
-          const blocks = matchedSupplier.supplier_blocks as Array<{ id: string; product_name: string; product_code: string | null }>
-          matchedBlock = blocks.find(
-            (b) =>
-              b.product_code === item.codigoProduto ||
-              b.product_name.toLowerCase().includes(item.descricao.toLowerCase().slice(0, 10))
-          )
-        }
-
-        newResults.push({
-          parsed,
-          supplierId: matchedSupplier?.id ?? null,
-          supplierName: matchedSupplier?.name ?? null,
-          blockId: matchedBlock?.id ?? null,
-          blockName: matchedBlock?.product_name ?? null,
-          periodId: null,
-          fileName: file.name,
-        })
-      } catch (e) {
-        toast({ title: `Erro em ${file.name}`, description: String(e), variant: 'destructive' })
+      if (supErr) {
+        setGlobalError(`Erro ao buscar fornecedores: ${supErr.message}`)
+        return
       }
-    }
 
-    setResults(newResults)
-    setProcessing(false)
+      const suppliers = (suppliersRaw ?? []) as Array<{
+        id: string
+        name: string
+        document: string | null
+        supplier_blocks: Array<{ id: string; product_name: string; product_code: string | null }>
+      }>
+
+      const newResults: MatchResult[] = []
+
+      for (const file of Array.from(files)) {
+        if (!file.name.toLowerCase().endsWith('.xml')) continue
+
+        try {
+          const text = await file.text()
+          const parsed = await withTimeout(parseNFe(text), 10000, file.name)
+
+          const matchedSupplier = suppliers.find(
+            (s) => s.document?.replace(/\D/g, '') === parsed.cnpjEmitente
+          )
+
+          let matchedBlock = null
+          if (matchedSupplier && parsed.itens.length > 0) {
+            const item = parsed.itens[0]
+            matchedBlock = matchedSupplier.supplier_blocks.find(
+              (b) =>
+                (b.product_code && b.product_code === item.codigoProduto) ||
+                b.product_name.toLowerCase().includes(item.descricao.toLowerCase().slice(0, 10))
+            )
+          }
+
+          newResults.push({
+            parsed,
+            supplierId: matchedSupplier?.id ?? null,
+            supplierName: matchedSupplier?.name ?? null,
+            blockId: matchedBlock?.id ?? null,
+            blockName: matchedBlock?.product_name ?? null,
+            periodId: null,
+            fileName: file.name,
+          })
+        } catch (e) {
+          newResults.push({
+            parsed: {
+              cnpjEmitente: '',
+              nomeEmitente: '',
+              numeroNF: '',
+              dataEmissao: '',
+              itens: [],
+              valorTotal: 0,
+            },
+            supplierId: null,
+            supplierName: null,
+            blockId: null,
+            blockName: null,
+            periodId: null,
+            fileName: file.name,
+            error: String(e),
+          })
+        }
+      }
+
+      setResults(newResults)
+    } catch (e) {
+      setGlobalError(String(e))
+    } finally {
+      setProcessing(false)
+    }
   }
 
   const handleDrop = (e: React.DragEvent) => {
@@ -95,68 +137,73 @@ export function ImportModal() {
     setImporting(true)
     let imported = 0
 
-    for (const r of results) {
-      if (!r.blockId) continue
+    try {
+      for (const r of results) {
+        if (!r.blockId || r.error) continue
 
-      // Find or create period for the supplier's company
-      const { data: block } = await supabase
-        .from('supplier_blocks')
-        .select('supplier_id, suppliers(company_id)')
-        .eq('id', r.blockId)
-        .single()
+        const { data: block } = await supabase
+          .from('supplier_blocks')
+          .select('supplier_id, suppliers(company_id)')
+          .eq('id', r.blockId)
+          .single()
 
-      if (!block) continue
-      const companyId = (block.suppliers as unknown as Record<string, string>)?.company_id
+        if (!block) continue
+        const companyId = (block.suppliers as unknown as Record<string, string>)?.company_id
 
-      // Get or create period
-      const { data: period } = await supabase
-        .from('periods')
-        .upsert(
-          {
-            company_id: companyId,
-            year: current.year,
-            month: current.month,
-            half: current.half,
-            label: getPeriodLabel(current.year, current.month, current.half),
-          },
-          { onConflict: 'company_id,year,month,half' }
-        )
-        .select('id')
-        .single()
+        const { data: period } = await supabase
+          .from('periods')
+          .upsert(
+            {
+              company_id: companyId,
+              year: current.year,
+              month: current.month,
+              half: current.half,
+              label: getPeriodLabel(current.year, current.month, current.half),
+            },
+            { onConflict: 'company_id,year,month,half' }
+          )
+          .select('id')
+          .single()
 
-      if (!period) continue
+        if (!period) continue
 
-      for (const item of r.parsed.itens) {
-        const priceCheck = calcPriceCheck(item.valorTotal, item.quantidade)
-        const { error } = await supabase.from('entries').insert({
-          supplier_block_id: r.blockId,
-          period_id: period.id,
-          entry_date: r.parsed.dataEmissao,
-          nf_number: r.parsed.numeroNF,
-          weight_nf: item.quantidade,
-          value_nf: item.valorTotal,
-          price_check: priceCheck,
-          status: 'nao_verificado',
-          source: 'xml',
-          raw_data: { parsed: r.parsed, item },
-        })
-        if (!error) imported++
+        for (const item of r.parsed.itens) {
+          const priceCheck = calcPriceCheck(item.valorTotal, item.quantidade)
+          const { error } = await supabase.from('entries').insert({
+            supplier_block_id: r.blockId,
+            period_id: period.id,
+            entry_date: r.parsed.dataEmissao || null,
+            nf_number: r.parsed.numeroNF || null,
+            weight_nf: item.quantidade || null,
+            value_nf: item.valorTotal || null,
+            price_check: priceCheck,
+            status: 'nao_verificado',
+            source: 'xml',
+            raw_data: { parsed: r.parsed, item },
+          })
+          if (!error) imported++
+          else console.error('[IMPORT] erro ao inserir entry:', error)
+        }
       }
-    }
 
-    toast({
-      title: `${imported} lançamento${imported !== 1 ? 's' : ''} importado${imported !== 1 ? 's' : ''}`,
-      variant: 'success',
-    })
-    setImporting(false)
-    setOpen(false)
-    setResults([])
+      toast({
+        title: `${imported} lançamento${imported !== 1 ? 's' : ''} importado${imported !== 1 ? 's' : ''}`,
+        variant: 'success',
+      })
+      setOpen(false)
+      setResults([])
+      setGlobalError(null)
+    } catch (e) {
+      setGlobalError(`Erro ao importar: ${String(e)}`)
+    } finally {
+      setImporting(false)
+    }
   }
 
-  const readyCount = results.filter((r) => r.blockId).length
+  const readyCount = results.filter((r) => r.blockId && !r.error).length
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) { setResults([]); setGlobalError(null) } }}>
       <DialogTrigger asChild>
         <Button variant="outline" size="sm" className="gap-1.5">
           <Upload className="h-4 w-4" />
@@ -197,6 +244,13 @@ export function ImportModal() {
           </div>
         )}
 
+        {globalError && (
+          <div className="flex items-start gap-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">
+            <X className="mt-0.5 h-4 w-4 shrink-0" />
+            {globalError}
+          </div>
+        )}
+
         {/* Results */}
         {results.length > 0 && (
           <div className="max-h-64 overflow-y-auto space-y-2">
@@ -208,29 +262,37 @@ export function ImportModal() {
                 <FileText className="mt-0.5 h-4 w-4 shrink-0 text-stone-400" />
                 <div className="min-w-0 flex-1 text-sm">
                   <p className="font-medium text-stone-800 truncate">{r.fileName}</p>
-                  <p className="text-xs text-stone-500">
-                    NF {r.parsed.numeroNF} · {r.parsed.nomeEmitente} · {r.parsed.dataEmissao}
-                  </p>
-                  <div className="mt-1 flex items-center gap-1.5 flex-wrap">
-                    {r.supplierName ? (
-                      <Badge variant="green" className="text-[10px] gap-1">
-                        <Check className="h-2.5 w-2.5" />
-                        {r.supplierName}
-                      </Badge>
-                    ) : (
-                      <Badge variant="red" className="text-[10px] gap-1">
-                        <AlertTriangle className="h-2.5 w-2.5" />
-                        CNPJ não identificado
-                      </Badge>
-                    )}
-                    {r.blockName ? (
-                      <Badge variant="secondary" className="text-[10px]">
-                        {r.blockName}
-                      </Badge>
-                    ) : r.supplierName ? (
-                      <Badge variant="amber" className="text-[10px]">Bloco não identificado</Badge>
-                    ) : null}
-                  </div>
+                  {r.error ? (
+                    <p className="text-xs text-red-600 mt-0.5">{r.error}</p>
+                  ) : (
+                    <>
+                      <p className="text-xs text-stone-500">
+                        NF {r.parsed.numeroNF} · {r.parsed.nomeEmitente || `CNPJ: ${r.parsed.cnpjEmitente || '?'}`} · {r.parsed.dataEmissao}
+                      </p>
+                      <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                        {r.supplierName ? (
+                          <Badge variant="green" className="text-[10px] gap-1">
+                            <Check className="h-2.5 w-2.5" />
+                            {r.supplierName}
+                          </Badge>
+                        ) : (
+                          <Badge variant="red" className="text-[10px] gap-1">
+                            <AlertTriangle className="h-2.5 w-2.5" />
+                            {r.parsed.cnpjEmitente
+                              ? `Fornecedor não encontrado — CNPJ: ${r.parsed.cnpjEmitente}`
+                              : 'CNPJ não identificado'}
+                          </Badge>
+                        )}
+                        {r.blockName ? (
+                          <Badge variant="secondary" className="text-[10px]">
+                            {r.blockName}
+                          </Badge>
+                        ) : r.supplierName ? (
+                          <Badge variant="amber" className="text-[10px]">Bloco não identificado</Badge>
+                        ) : null}
+                      </div>
+                    </>
+                  )}
                 </div>
               </div>
             ))}
