@@ -23,9 +23,18 @@ export function LoginPage() {
     e.preventDefault()
     setError('')
     setLoading(true)
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) setError('Email ou senha inválidos.')
-    else navigate('/app')
+
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password })
+
+    console.log('[LOGIN] URL:', import.meta.env.VITE_SUPABASE_URL)
+    console.log('[LOGIN] error:', error)
+    console.log('[LOGIN] data:', data)
+
+    if (error) {
+      setError(`Erro: ${error.message} (${error.status ?? 'sem status'})`)
+    } else {
+      navigate('/app')
+    }
     setLoading(false)
   }
 
