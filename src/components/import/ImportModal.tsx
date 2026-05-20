@@ -15,6 +15,21 @@ import { getPeriodLabel, calcPriceCheck } from '@/lib/calculations'
 import { parseNFe, formatCNPJ, type ParsedNFe } from './XmlParser'
 import { toast } from '@/hooks/useToast'
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type SupplierRow = {
+  id: string
+  name: string
+  document: string | null
+}
+
+type BlockRow = {
+  id: string
+  supplier_id: string
+  product_name: string
+  product_code: string | null
+}
+
 interface MatchResult {
   parsed: ParsedNFe
   supplierId: string | null
@@ -25,25 +40,28 @@ interface MatchResult {
   error?: string
 }
 
-type SupplierRow = {
-  id: string
-  name: string
-  document: string | null
-  supplier_blocks: Array<{ id: string; product_name: string; product_code: string | null }>
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// FileReader com melhor compatibilidade que file.text()
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = (e) => resolve((e.target?.result as string) ?? '')
+    reader.onerror = () => reject(new Error(`Erro ao ler ${file.name}`))
+    reader.readAsText(file, 'UTF-8')
+  })
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, name: string): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
     new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout: ${name} demorou mais de ${ms / 1000}s`)), ms)
+      setTimeout(() => reject(new Error(`Timeout (${ms / 1000}s): ${label}`)), ms)
     ),
   ])
 }
 
-// Matching bidirecional: verifica se alguma palavra significativa (>3 chars)
-// do xProd aparece no nome do bloco ou vice-versa.
-// Ex: "SERRAGEM VERDE" ↔ "Serragem" → match
+// Matching bidirecional: "SERRAGEM VERDE" ↔ "Serragem"
 function descricaoMatch(blockName: string, descricao: string): boolean {
   const block = blockName.toLowerCase()
   const desc = descricao.toLowerCase()
@@ -52,12 +70,26 @@ function descricaoMatch(blockName: string, descricao: string): boolean {
   return descWords.some((w) => block.includes(w)) || blockWords.some((w) => desc.includes(w))
 }
 
+const emptyParsed: ParsedNFe = {
+  cnpjEmitente: '',
+  nomeEmitente: '',
+  cnpjDestinatario: '',
+  numeroNF: '',
+  dataEmissao: '',
+  placaCaminhao: '',
+  itens: [],
+  valorTotal: 0,
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
 export function ImportModal() {
   const [open, setOpen] = useState(false)
   const [results, setResults] = useState<MatchResult[]>([])
   const [processing, setProcessing] = useState(false)
   const [importing, setImporting] = useState(false)
   const [globalError, setGlobalError] = useState<string | null>(null)
+  const [debugInfo, setDebugInfo] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const { current } = usePeriodStore()
 
@@ -65,12 +97,17 @@ export function ImportModal() {
     setProcessing(true)
     setResults([])
     setGlobalError(null)
+    setDebugInfo(null)
 
     try {
+      // ── 1. Busca fornecedores (query simples, sem join) ──────────────────
+      console.log('[IMPORT] Buscando fornecedores...')
       const { data: suppliersRaw, error: supErr } = await supabase
         .from('suppliers')
-        .select('id, name, document, supplier_blocks(id, product_name, product_code)')
+        .select('id, name, document')
         .eq('active', true)
+
+      console.log('[IMPORT] Fornecedores:', suppliersRaw?.length ?? 0, supErr?.message)
 
       if (supErr) {
         setGlobalError(`Erro ao buscar fornecedores: ${supErr.message}`)
@@ -78,29 +115,59 @@ export function ImportModal() {
       }
 
       const suppliers = (suppliersRaw ?? []) as SupplierRow[]
+
+      // ── 2. Busca blocos de todos os fornecedores ─────────────────────────
+      console.log('[IMPORT] Buscando blocos de produto...')
+      const { data: blocksRaw, error: blkErr } = await supabase
+        .from('supplier_blocks')
+        .select('id, supplier_id, product_name, product_code')
+        .eq('active', true)
+
+      console.log('[IMPORT] Blocos:', blocksRaw?.length ?? 0, blkErr?.message)
+
+      const blocks = (blocksRaw ?? []) as BlockRow[]
+
+      // ── 3. Processa cada arquivo XML ─────────────────────────────────────
       const newResults: MatchResult[] = []
 
       for (const file of Array.from(files)) {
         if (!file.name.toLowerCase().endsWith('.xml')) continue
 
+        console.log('[IMPORT] Lendo arquivo:', file.name, `(${file.size} bytes)`)
+
         try {
-          const text = await file.text()
-          const parsed = await withTimeout(parseNFe(text), 10000, file.name)
+          const text = await withTimeout(readFileAsText(file), 5000, `ler ${file.name}`)
+          console.log('[IMPORT] Arquivo lido, chars:', text.length)
+
+          const parsed = await withTimeout(parseNFe(text), 10000, `parse ${file.name}`)
+          console.log('[IMPORT] Dados extraídos:', {
+            cnpj: parsed.cnpjEmitente,
+            emitente: parsed.nomeEmitente,
+            nf: parsed.numeroNF,
+            data: parsed.dataEmissao,
+            placa: parsed.placaCaminhao,
+            itens: parsed.itens,
+          })
 
           // Busca fornecedor pelo CNPJ emitente (sem formatação)
           const matchedSupplier = suppliers.find(
             (s) => s.document?.replace(/\D/g, '') === parsed.cnpjEmitente
           )
+          console.log(
+            '[IMPORT] Fornecedor:',
+            matchedSupplier?.name ?? `NÃO ENCONTRADO (CNPJ: ${parsed.cnpjEmitente})`
+          )
 
-          // Identifica o bloco: primeiro tenta código exato, depois matching por descrição
-          let matchedBlock: SupplierRow['supplier_blocks'][number] | undefined
+          // Busca bloco por código ou descrição
+          let matchedBlock: BlockRow | undefined
           if (matchedSupplier && parsed.itens.length > 0) {
             const item = parsed.itens[0]
+            const supplierBlocks = blocks.filter((b) => b.supplier_id === matchedSupplier.id)
+            console.log('[IMPORT] Blocos do fornecedor:', supplierBlocks.map((b) => b.product_name))
             matchedBlock =
-              matchedSupplier.supplier_blocks.find(
-                (b) => b.product_code && b.product_code === item.codigoProduto
-              ) ??
-              matchedSupplier.supplier_blocks.find((b) => descricaoMatch(b.product_name, item.descricao))
+              supplierBlocks.find((b) => b.product_code && b.product_code === item.codigoProduto) ??
+              supplierBlocks.find((b) => descricaoMatch(b.product_name, item.descricao))
+            console.log('[IMPORT] Bloco:', matchedBlock?.product_name ?? 'NÃO IDENTIFICADO')
           }
 
           newResults.push({
@@ -112,17 +179,9 @@ export function ImportModal() {
             fileName: file.name,
           })
         } catch (e) {
+          console.error('[IMPORT] Erro ao processar', file.name, e)
           newResults.push({
-            parsed: {
-              cnpjEmitente: '',
-              nomeEmitente: '',
-              cnpjDestinatario: '',
-              numeroNF: '',
-              dataEmissao: '',
-              placaCaminhao: '',
-              itens: [],
-              valorTotal: 0,
-            },
+            parsed: emptyParsed,
             supplierId: null,
             supplierName: null,
             blockId: null,
@@ -134,10 +193,15 @@ export function ImportModal() {
       }
 
       setResults(newResults)
+      setDebugInfo(
+        `${suppliers.length} fornecedor(es) · ${blocks.length} bloco(s) carregado(s)`
+      )
     } catch (e) {
+      console.error('[IMPORT] Erro global:', e)
       setGlobalError(String(e))
     } finally {
       setProcessing(false)
+      console.log('[IMPORT] Processamento finalizado')
     }
   }
 
@@ -196,7 +260,7 @@ export function ImportModal() {
             raw_data: { parsed: r.parsed, item },
           })
           if (!error) imported++
-          else console.error('[IMPORT] erro ao inserir entry:', error)
+          else console.error('[IMPORT] Erro ao inserir entry:', error)
         }
       }
 
@@ -224,6 +288,7 @@ export function ImportModal() {
         if (!v) {
           setResults([])
           setGlobalError(null)
+          setDebugInfo(null)
         }
       }}
     >
@@ -274,6 +339,10 @@ export function ImportModal() {
           </div>
         )}
 
+        {debugInfo && !processing && (
+          <p className="text-xs text-stone-400">{debugInfo}</p>
+        )}
+
         {/* Resultados */}
         {results.length > 0 && (
           <div className="max-h-64 overflow-y-auto space-y-2">
@@ -308,7 +377,7 @@ export function ImportModal() {
                             <AlertTriangle className="h-2.5 w-2.5" />
                             {r.parsed.cnpjEmitente
                               ? `Fornecedor não encontrado: CNPJ ${formatCNPJ(r.parsed.cnpjEmitente)}${r.parsed.nomeEmitente ? ` (${r.parsed.nomeEmitente})` : ''}`
-                              : 'CNPJ não identificado'}
+                              : 'CNPJ não identificado no XML'}
                           </Badge>
                         )}
                         {r.blockName ? (
@@ -321,12 +390,23 @@ export function ImportModal() {
                           </Badge>
                         ) : null}
                       </div>
-                      {/* Preview dos dados que serão importados */}
                       {r.blockId && r.parsed.itens.length > 0 && (
                         <div className="mt-2 grid grid-cols-3 gap-x-4 text-[11px] text-stone-500">
-                          <span>Ton. NF: <strong>{r.parsed.itens[0].quantidade}</strong></span>
-                          <span>Valor: <strong>R$ {r.parsed.itens[0].valorTotal.toLocaleString('pt-BR', { minimumFractionDigits: 2 })}</strong></span>
-                          <span>Caminhão: <strong>{r.parsed.placaCaminhao || '—'}</strong></span>
+                          <span>
+                            Ton. NF: <strong>{r.parsed.itens[0].quantidade}</strong>
+                          </span>
+                          <span>
+                            Valor:{' '}
+                            <strong>
+                              R${' '}
+                              {r.parsed.itens[0].valorTotal.toLocaleString('pt-BR', {
+                                minimumFractionDigits: 2,
+                              })}
+                            </strong>
+                          </span>
+                          <span>
+                            Placa: <strong>{r.parsed.placaCaminhao || '—'}</strong>
+                          </span>
                         </div>
                       )}
                     </>
@@ -340,7 +420,8 @@ export function ImportModal() {
         {results.length > 0 && (
           <div className="flex items-center justify-between border-t border-stone-200 pt-3">
             <p className="text-sm text-stone-500">
-              {readyCount} de {results.length} pronto{results.length !== 1 ? 's' : ''} para importar
+              {readyCount} de {results.length} pronto{results.length !== 1 ? 's' : ''} para
+              importar
             </p>
             <Button
               onClick={handleImport}
