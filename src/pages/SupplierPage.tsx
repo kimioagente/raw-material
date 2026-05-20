@@ -23,9 +23,10 @@ export function SupplierPage() {
 
     const load = async () => {
       setLoading(true)
+      try {
 
       const [{ data: sup }, { data: blks }] = await Promise.all([
-        supabase.from('suppliers').select('*').eq('id', supplierId).single(),
+        supabase.from('suppliers').select('*').eq('id', supplierId).maybeSingle(),
         supabase
           .from('supplier_blocks')
           .select('*')
@@ -67,7 +68,9 @@ export function SupplierPage() {
         }
       }
 
-      setLoading(false)
+      } finally {
+        setLoading(false)
+      }
     }
 
     load()

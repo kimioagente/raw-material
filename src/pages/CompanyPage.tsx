@@ -24,24 +24,28 @@ export function CompanyPage() {
   const slug = company as CompanySlug
 
   useEffect(() => {
+    if (!company) return
     const load = async () => {
       setLoading(true)
-      const { data: co } = await supabase
-        .from('companies')
-        .select('id')
-        .eq('slug', slug)
-        .single()
-      if (!co) return
+      try {
+        const { data: co } = await supabase
+          .from('companies')
+          .select('id')
+          .eq('slug', slug)
+          .maybeSingle()
+        if (!co) return
 
-      const { data } = await supabase
-        .from('suppliers')
-        .select('*')
-        .eq('company_id', co.id)
-        .eq('active', true)
-        .order('display_order')
+        const { data } = await supabase
+          .from('suppliers')
+          .select('*')
+          .eq('company_id', co.id)
+          .eq('active', true)
+          .order('display_order')
 
-      setSuppliers(data ?? [])
-      setLoading(false)
+        setSuppliers(data ?? [])
+      } finally {
+        setLoading(false)
+      }
     }
     load()
   }, [slug])

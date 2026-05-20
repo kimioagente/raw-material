@@ -28,16 +28,17 @@ export function FreightPage() {
   const carriers = CARRIERS[slug] ?? []
 
   useEffect(() => {
+    if (!company) return
     const load = async () => {
       setLoading(true)
-
+      try {
       const { data: co } = await supabase
         .from('companies')
         .select('id')
         .eq('slug', slug)
-        .single()
+        .maybeSingle()
 
-      if (!co) return setLoading(false)
+      if (!co) return
       setCompanyId(co.id)
 
       // Get or create period
@@ -67,8 +68,9 @@ export function FreightPage() {
           .order('entry_date', { ascending: true })
         setRecords((recs as FreightRecord[]) ?? [])
       }
-
-      setLoading(false)
+      } finally {
+        setLoading(false)
+      }
     }
     load()
   }, [slug, current])

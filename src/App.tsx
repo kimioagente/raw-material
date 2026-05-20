@@ -26,13 +26,10 @@ const router = createBrowserRouter([
     ),
     children: [
       { index: true, element: <HomePage /> },
-      { path: 'madeiras', element: <CompanyPage /> },
-      { path: 'madeiras/frete', element: <FreightPage /> },
-      { path: 'madeiras/:supplierId', element: <SupplierPage /> },
-      { path: 'pellets', element: <CompanyPage /> },
-      { path: 'pellets/frete', element: <FreightPage /> },
-      { path: 'pellets/:supplierId', element: <SupplierPage /> },
       { path: 'settings', element: <SettingsPage /> },
+      { path: ':company', element: <CompanyPage /> },
+      { path: ':company/frete', element: <FreightPage /> },
+      { path: ':company/:supplierId', element: <SupplierPage /> },
     ],
   },
   {
