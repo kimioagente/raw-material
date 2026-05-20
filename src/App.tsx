@@ -45,16 +45,32 @@ export function App() {
   const { setUser, setProfile, setLoading } = useAuthStore()
 
   useEffect(() => {
+    const fetchOrCreateProfile = async (userId: string, email?: string): Promise<Profile | null> => {
+      // maybeSingle returns null (not 406) when no row exists
+      const { data: existing } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .maybeSingle()
+
+      if (existing) return existing as Profile
+
+      // Profile not found — create one (trigger may not have fired if user pre-existed the schema)
+      const { data: created } = await supabase
+        .from('profiles')
+        .insert({ id: userId, name: email ?? null, role: 'viewer' })
+        .select('*')
+        .maybeSingle()
+
+      return created as Profile | null
+    }
+
     // Get initial session
     supabase.auth.getSession().then(async ({ data: { session } }) => {
       setUser(session?.user ?? null)
       if (session?.user) {
-        const { data } = await supabase
-          .from('profiles')
-          .select('*')
-          .eq('id', session.user.id)
-          .single()
-        setProfile(data as Profile | null)
+        const profile = await fetchOrCreateProfile(session.user.id, session.user.email)
+        setProfile(profile)
       }
       setLoading(false)
     })
@@ -64,12 +80,8 @@ export function App() {
       async (_event, session) => {
         setUser(session?.user ?? null)
         if (session?.user) {
-          const { data } = await supabase
-            .from('profiles')
-            .select('*')
-            .eq('id', session.user.id)
-            .single()
-          setProfile(data as Profile | null)
+          const profile = await fetchOrCreateProfile(session.user.id, session.user.email)
+          setProfile(profile)
         } else {
           setProfile(null)
         }
